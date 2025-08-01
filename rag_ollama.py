@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime
 from huggingface_hub import login
 
-hf_token = os.getenv('HF_TOKEN')
+hf_token = st.secrets['HF_TOKEN']
 login(token = hf_token)
 
 class EnhancedRAGAgent:
