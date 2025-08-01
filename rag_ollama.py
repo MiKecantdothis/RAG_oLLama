@@ -3,11 +3,12 @@ import PyPDF2
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
-import ollama
 import pickle
 import os
 from typing import List, Dict
 import re
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
 # Initialize session state
 if 'vector_store' not in st.session_state:
@@ -23,6 +24,42 @@ class PDFChatbot:
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.vector_store = None
         self.document_chunks = []
+
+        # Load TinyLlama
+        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+        )
+        self.model.eval()
+
+    def generate_response(self, query: str, context: list[str]) -> str:
+        context_text = "\n".join(context)
+        prompt = f"""<|system|>You are a helpful assistant.<|end|>
+          <|user|>Based on the following document context, answer the question.
+           Context: {context_text} 
+           Question: {query}
+           <|end|> 
+           <|assistant|>"""
+
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=True,
+                top_k=50,
+                top_p=0.95,
+                temperature=0.7,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Extract assistant response
+        if "<|assistant|>" in decoded:
+            decoded = decoded.split("<|assistant|>")[-1].strip()
+        return decoded
 
     def extract_text_from_pdf(self, pdf_file) -> str:
         """Extract text from uploaded PDF file"""
@@ -74,33 +111,7 @@ class PDFChatbot:
 
         return relevant_chunks
 
-    def generate_response(self, query: str, context: List[str]) -> str:
-        """Generate response using Llama model with context"""
-        context_text = "\n".join(context)
-
-        prompt = f"""Based on the following context from the document, please answer the question. If the answer cannot be found in the context, please say so.
-
-Context:
-{context_text}
-
-Question: {query}
-
-Answer:"""
-
-        try:
-            response = ollama.chat(
-                model='llama3.3',  # You can change this to your preferred Llama model
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': prompt
-                    }
-                ]
-            )
-            return response['message']['content']
-        except Exception as e:
-            return f"Error generating response: {str(e)}. Make sure Ollama is running and the model is installed."
-
+    
 def main():
     st.title("📚 RAG PDF Chatbot with Llama")
     st.markdown("Upload a PDF document and chat with it using local Llama model!")
