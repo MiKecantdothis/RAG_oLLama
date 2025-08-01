@@ -1,406 +1,463 @@
-import streamlit as st
-import PyPDF2
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import pickle
 import os
-from typing import List, Dict
-import re
+import PyPDF2
+import numpy as np
+import faiss
+import streamlit as st
+from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
+import re
+import pickle
+from typing import List, Dict, Tuple
+import tempfile
+from datetime import datetime
 
-# Initialize session state
-if 'vector_store' not in st.session_state:
-    st.session_state.vector_store = None
-if 'document_chunks' not in st.session_state:
-    st.session_state.document_chunks = []
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-
-
-class PDFChatbot:
-    def __init__(self):
-        try:
-            # Initialize embedding model
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            self.vector_store = None
-            self.document_chunks = []
-
-            # Load TinyLlama with error handling
-            model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-            
-            # Check if CUDA is available
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            
-            # Add padding token if not present
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                device_map="auto" if device == "cuda" else None,
-                low_cpu_mem_usage=True
-            )
-            
-            if device == "cpu":
-                self.model = self.model.to(device)
-                
-            self.model.eval()
-            self.device = device
-            
-        except Exception as e:
-            st.error(f"Error initializing model: {str(e)}")
-            raise e
-
-    def generate_response(self, query: str, context: List[str]) -> str:
-        try:
-            context_text = "\n".join(context[:3])  # Limit context to avoid token limit
-            
-            # Create a more structured prompt
-            prompt = f"""<|system|>
-You are a helpful assistant. Answer questions based only on the provided context. If the answer cannot be found in the context, say "I cannot find this information in the provided document."
-<|end|>
-<|user|>
-Context: {context_text}
-
-Question: {query}
-<|end|>
-<|assistant|>"""
-
-            # Tokenize with proper padding and truncation
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                max_length=1024,
-                truncation=True,
-                padding=True
-            )
-            
-            # Move inputs to device
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=256,  # Reduced for better performance
-                    do_sample=True,
-                    top_k=50,
-                    top_p=0.95,
-                    temperature=0.7,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    repetition_penalty=1.1
-                )
-                
-            # Decode response
-            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            # Extract assistant response
-            if "<|assistant|>" in decoded:
-                response = decoded.split("<|assistant|>")[-1].strip()
-            else:
-                response = decoded.strip()
-                
-            # Clean up the response
-            response = re.sub(r'^[\s\n]*', '', response)  # Remove leading whitespace
-            response = re.sub(r'[\s\n]*$', '', response)  # Remove trailing whitespace
-            
-            return response if response else "I couldn't generate a proper response."
-            
-        except Exception as e:
-            return f"Error generating response: {str(e)}"
-
-    def extract_text_from_pdf(self, pdf_file) -> str:
-        """Extract text from uploaded PDF file"""
-        try:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
-            
-            for page_num, page in enumerate(pdf_reader.pages):
-                try:
-                    page_text = page.extract_text()
-                    if page_text.strip():  # Only add non-empty pages
-                        text += f"\n--- Page {page_num + 1} ---\n"
-                        text += page_text + "\n"
-                except Exception as e:
-                    st.warning(f"Could not extract text from page {page_num + 1}: {str(e)}")
-                    continue
-                    
-            if not text.strip():
-                raise ValueError("No text could be extracted from the PDF")
-                
-            return text
-            
-        except Exception as e:
-            st.error(f"Error extracting text from PDF: {str(e)}")
-            raise e
-
-    def chunk_text(self, text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
-        """Split text into overlapping chunks"""
-        try:
-            # Clean the text first
-            text = re.sub(r'\s+', ' ', text)  # Replace multiple whitespace with single space
-            text = text.strip()
-            
-            # Split by sentences first for better chunking
-            sentences = re.split(r'[.!?]+', text)
-            
-            chunks = []
-            current_chunk = ""
-            
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence:
-                    continue
-                    
-                # If adding this sentence would exceed chunk size, save current chunk
-                if len(current_chunk.split()) + len(sentence.split()) > chunk_size:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                        # Keep some overlap
-                        words = current_chunk.split()
-                        if len(words) > overlap:
-                            current_chunk = ' '.join(words[-overlap:]) + ' ' + sentence
-                        else:
-                            current_chunk = sentence
-                    else:
-                        current_chunk = sentence
-                else:
-                    current_chunk += ' ' + sentence if current_chunk else sentence
-            
-            # Add the last chunk
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            
-            # Filter out very short chunks
-            chunks = [chunk for chunk in chunks if len(chunk.split()) >= 10]
-            
-            return chunks
-            
-        except Exception as e:
-            st.error(f"Error chunking text: {str(e)}")
-            return []
-
-    def create_vector_store(self, chunks: List[str]):
-        """Create FAISS vector store from text chunks"""
-        try:
-            if not chunks:
-                raise ValueError("No chunks provided for vector store creation")
-                
-            # Generate embeddings
-            embeddings = self.embedding_model.encode(
-                chunks, 
-                show_progress_bar=True,
-                batch_size=32
-            )
-
-            # Create FAISS index - using cosine similarity
-            dimension = embeddings.shape[1]
-            self.vector_store = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
-
-            # Normalize embeddings for cosine similarity
-            embeddings_normalized = embeddings.copy()
-            faiss.normalize_L2(embeddings_normalized)
-            
-            # Add to index
-            self.vector_store.add(embeddings_normalized.astype('float32'))
-            self.document_chunks = chunks
-            
-        except Exception as e:
-            st.error(f"Error creating vector store: {str(e)}")
-            raise e
-
-    def search_similar_chunks(self, query: str, k: int = 3) -> List[str]:
-        """Search for similar chunks in the vector store"""
-        try:
-            if self.vector_store is None or not self.document_chunks:
-                return []
-
-            # Generate query embedding
-            query_embedding = self.embedding_model.encode([query])
-            
-            # Normalize for cosine similarity
-            faiss.normalize_L2(query_embedding)
-
-            # Search
-            scores, indices = self.vector_store.search(
-                query_embedding.astype('float32'), 
-                min(k, len(self.document_chunks))
-            )
-
-            relevant_chunks = []
-            for idx, score in zip(indices[0], scores[0]):
-                if idx >= 0 and idx < len(self.document_chunks) and score > 0.1:  # Threshold for relevance
-                    relevant_chunks.append(self.document_chunks[idx])
-
-            return relevant_chunks
-            
-        except Exception as e:
-            st.error(f"Error searching chunks: {str(e)}")
-            return []
-
+class EnhancedRAGAgent:
+    def __init__(self, 
+                 llm_model: str = "meta-llama/Llama-3.2-3B-Instruct",
+                 embedding_model: str = "all-MiniLM-L6-v2"):
+        """
+        Initialize the enhanced RAG agent with sentence transformers and FAISS.
+        
+        Args:
+            llm_model: HuggingFace model identifier for Llama 3.2
+            embedding_model: Sentence transformer model for embeddings
+        """
+        self.embedding_model_name = embedding_model
+        self.llm_model_name = llm_model
+        
+        # Initialize models (will be loaded lazily)
+        self.embedding_model = None
+        self.tokenizer = None
+        self.llm_model = None
+        
+        # Document storage
+        self.documents = []
+        self.document_chunks = []
+        self.chunk_metadata = []
+        
+        # FAISS index
+        self.faiss_index = None
+        self.embedding_dim = None
+        
+    @st.cache_resource
+    def load_embedding_model(_self):
+        """Load sentence transformer model (cached)."""
+        return SentenceTransformer(_self.embedding_model_name)
     
+    @st.cache_resource
+    def load_llm_model(_self):
+        """Load Llama model and tokenizer (cached)."""
+        tokenizer = AutoTokenizer.from_pretrained(_self.llm_model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            _self.llm_model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            low_cpu_mem_usage=True
+        )
+        
+        # Set pad token if not present
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            
+        return tokenizer, model
+    
+    def _ensure_models_loaded(self):
+        """Ensure all models are loaded."""
+        if self.embedding_model is None:
+            self.embedding_model = self.load_embedding_model()
+            self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+            
+        if self.tokenizer is None or self.llm_model is None:
+            self.tokenizer, self.llm_model = self.load_llm_model()
+    
+    def extract_text_from_pdf(self, pdf_file) -> str:
+        """
+        Extract text content from a PDF file.
+        
+        Args:
+            pdf_file: File object or path to PDF
+            
+        Returns:
+            Extracted text as string
+        """
+        try:
+            if hasattr(pdf_file, 'read'):
+                # It's a file object
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+            else:
+                # It's a file path
+                with open(pdf_file, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+            
+            text = ""
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text += page.extract_text() + "\n"
+            
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"Error reading PDF: {str(e)}")
+    
+    def chunk_text(self, text: str, chunk_size: int = 512, overlap: int = 50) -> List[str]:
+        """
+        Split text into overlapping chunks for better retrieval.
+        
+        Args:
+            text: Input text to chunk
+            chunk_size: Size of each chunk in characters
+            overlap: Overlap between chunks
+            
+        Returns:
+            List of text chunks
+        """
+        # Clean and normalize text
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            
+            # Try to break at sentence boundary
+            if end < len(text):
+                sentence_end = text.rfind('.', start, end)
+                if sentence_end > start + chunk_size - 100:
+                    end = sentence_end + 1
+            
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            
+            start = max(start + chunk_size - overlap, end)
+        
+        return chunks
+    
+    def add_pdf_document(self, pdf_file, filename: str = None) -> bool:
+        """
+        Add a PDF document to the knowledge base.
+        
+        Args:
+            pdf_file: PDF file object or path
+            filename: Optional filename for display
+            
+        Returns:
+            Success status
+        """
+        try:
+            self._ensure_models_loaded()
+            
+            # Extract text from PDF
+            text = self.extract_text_from_pdf(pdf_file)
+            
+            # Chunk the text
+            chunks = self.chunk_text(text)
+            
+            if not chunks:
+                return False
+            
+            # Store document info
+            doc_info = {
+                'filename': filename or 'uploaded_document.pdf',
+                'text': text,
+                'chunk_count': len(chunks),
+                'added_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            self.documents.append(doc_info)
+            
+            # Add chunks with metadata
+            start_idx = len(self.document_chunks)
+            self.document_chunks.extend(chunks)
+            
+            # Create metadata for each chunk
+            for i, chunk in enumerate(chunks):
+                metadata = {
+                    'doc_index': len(self.documents) - 1,
+                    'chunk_index': i,
+                    'filename': doc_info['filename'],
+                    'chunk_start_idx': start_idx + i
+                }
+                self.chunk_metadata.append(metadata)
+            
+            # Update FAISS index
+            self._update_faiss_index(chunks)
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"Error processing PDF: {str(e)}")
+            return False
+    
+    def _update_faiss_index(self, new_chunks: List[str]):
+        """Update FAISS index with new chunks."""
+        self._ensure_models_loaded()
+        
+        # Generate embeddings for new chunks
+        embeddings = self.embedding_model.encode(new_chunks)
+        embeddings = embeddings.astype('float32')
+        
+        if self.faiss_index is None:
+            # Initialize FAISS index
+            self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)  # Inner product for cosine similarity
+            
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
+        # Add to FAISS index
+        self.faiss_index.add(embeddings)
+    
+    def retrieve_relevant_chunks(self, query: str, top_k: int = 3) -> List[Tuple[str, float, Dict]]:
+        """
+        Retrieve the most relevant document chunks for a query using FAISS.
+        
+        Args:
+            query: User query
+            top_k: Number of top chunks to retrieve
+            
+        Returns:
+            List of (chunk_text, similarity_score, metadata) tuples
+        """
+        if not self.document_chunks or self.faiss_index is None:
+            return []
+        
+        self._ensure_models_loaded()
+        
+        # Generate query embedding
+        query_embedding = self.embedding_model.encode([query]).astype('float32')
+        faiss.normalize_L2(query_embedding)
+        
+        # Search in FAISS index
+        similarities, indices = self.faiss_index.search(query_embedding, top_k)
+        
+        relevant_chunks = []
+        for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
+            if idx < len(self.document_chunks) and similarity > 0.1:  # Similarity threshold
+                chunk_text = self.document_chunks[idx]
+                metadata = self.chunk_metadata[idx]
+                relevant_chunks.append((chunk_text, float(similarity), metadata))
+        
+        return relevant_chunks
+    
+    def generate_response(self, query: str, context: str) -> str:
+        """
+        Generate a response using Llama 3.2 with the given context.
+        
+        Args:
+            query: User query
+            context: Retrieved context from documents
+            
+        Returns:
+            Generated response
+        """
+        self._ensure_models_loaded()
+        
+        # Create prompt with context
+        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful assistant that answers questions based on the provided context. Use the context to answer the user's question accurately and concisely. If the context doesn't contain relevant information, say so clearly.
+
+Context:
+{context}
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+        
+        # Tokenize and generate
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        
+        with torch.no_grad():
+            outputs = self.llm_model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=0.7,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # Decode response
+        response = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+        return response.strip()
+    
+    def chat(self, query: str) -> Tuple[str, List[Tuple[str, float, Dict]]]:
+        """
+        Main chat function that retrieves context and generates response.
+        
+        Args:
+            query: User query
+            
+        Returns:
+            Tuple of (AI response, relevant chunks with metadata)
+        """
+        if not self.document_chunks:
+            return "No documents have been added to the knowledge base. Please upload PDF documents first.", []
+        
+        # Retrieve relevant context
+        relevant_chunks = self.retrieve_relevant_chunks(query, top_k=3)
+        
+        if not relevant_chunks:
+            return "I couldn't find relevant information in the loaded documents to answer your question.", []
+        
+        # Combine context from retrieved chunks
+        context = "\n\n".join([chunk for chunk, _, _ in relevant_chunks])
+        
+        # Generate response
+        response = self.generate_response(query, context)
+        
+        return response, relevant_chunks
+
+
+# Streamlit UI
 def main():
     st.set_page_config(
-        page_title="RAG PDF Chatbot",
-        page_icon="📚",
+        page_title="RAG Agent with Llama 3.2",
+        page_icon="🤖",
         layout="wide"
     )
     
-    st.title("📚 RAG PDF Chatbot with TinyLlama")
-    st.markdown("Upload a PDF document and chat with it using a local language model!")
-
-    # Initialize chatbot with error handling
-    try:
-        if 'chatbot' not in st.session_state:
-            with st.spinner("Loading language model... This may take a few minutes on first run."):
-                st.session_state.chatbot = PDFChatbot()
-            st.success("✅ Language model loaded successfully!")
-    except Exception as e:
-        st.error(f"Failed to load language model: {str(e)}")
-        st.stop()
-
-    # Sidebar for PDF upload and processing
-    with st.sidebar:
-        st.header("📄 Document Upload")
-        uploaded_file = st.file_uploader(
-            "Choose a PDF file",
-            type="pdf",
-            help="Upload a PDF document to chat with"
-        )
-
-        if uploaded_file is not None:
-            st.info(f"📎 File: {uploaded_file.name}")
-            
-            if st.button("Process Document", type="primary"):
-                try:
-                    with st.spinner("Processing PDF..."):
-                        # Extract text
-                        text = st.session_state.chatbot.extract_text_from_pdf(uploaded_file)
-                        
-                        if not text.strip():
-                            st.error("No text found in the PDF. Please upload a different file.")
-                            return
-
-                        # Chunk text
-                        chunks = st.session_state.chatbot.chunk_text(text)
-                        
-                        if not chunks:
-                            st.error("Could not create text chunks. Please try a different PDF.")
-                            return
-
-                        # Create vector store
-                        st.session_state.chatbot.create_vector_store(chunks)
-
-                        # Store in session state
-                        st.session_state.vector_store = st.session_state.chatbot.vector_store
-                        st.session_state.document_chunks = st.session_state.chatbot.document_chunks
-
-                        st.success(f"✅ Document processed! Created {len(chunks)} chunks.")
-                        
-                except Exception as e:
-                    st.error(f"Error processing document: {str(e)}")
-
-        # Display document info
-        if st.session_state.vector_store is not None:
-            st.success("📊 Document Ready")
-            st.info(f"Chunks: {len(st.session_state.document_chunks)}")
-
-        st.markdown("---")
-        st.markdown("### 🛠️ System Info")
-        st.info(f"Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
-        
-        st.markdown("### 📋 Requirements")
-        st.markdown("""
-        Install required packages:
-        ```bash
-        pip install streamlit PyPDF2 faiss-cpu sentence-transformers transformers torch numpy
-        ```
-        """)
-
-        if st.button("Clear Chat History"):
-            st.session_state.chat_history = []
-            st.rerun()
-
-    # Main chat interface
-    if st.session_state.vector_store is None:
-        st.info("👆 Please upload and process a PDF document to start chatting!")
-        return
-
-    # Display chat history
-    st.subheader("💬 Chat with your document")
+    st.title("🤖 RAG Agent with Llama 3.2")
+    st.markdown("Upload PDF documents and chat with them using advanced AI!")
     
-    # Create columns for better layout
-    col1, col2 = st.columns([3, 1])
+    # Initialize session state
+    if 'rag_agent' not in st.session_state:
+        st.session_state.rag_agent = EnhancedRAGAgent()
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Sidebar for document management
+    with st.sidebar:
+        st.header("📚 Document Management")
+        
+        # File upload
+        uploaded_files = st.file_uploader(
+            "Upload PDF documents",
+            type=['pdf'],
+            accept_multiple_files=True,
+            help="Upload one or more PDF files to add to the knowledge base"
+        )
+        
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                if st.button(f"Process {uploaded_file.name}", key=f"process_{uploaded_file.name}"):
+                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                        success = st.session_state.rag_agent.add_pdf_document(
+                            uploaded_file, uploaded_file.name
+                        )
+                        if success:
+                            st.success(f"✅ Added {uploaded_file.name}")
+                        else:
+                            st.error(f"❌ Failed to process {uploaded_file.name}")
+        
+        # Document info
+        st.subheader("📄 Loaded Documents")
+        docs = st.session_state.rag_agent.documents
+        if docs:
+            for i, doc in enumerate(docs):
+                with st.expander(f"{doc['filename']}"):
+                    st.write(f"**Chunks:** {doc['chunk_count']}")
+                    st.write(f"**Added:** {doc['added_at']}")
+                    st.write(f"**Text length:** {len(doc['text'])} characters")
+        else:
+            st.info("No documents loaded yet.")
+    
+    # Main chat interface
+    col1, col2 = st.columns([2, 1])
     
     with col1:
-        # Display chat history
-        for i, (query, response) in enumerate(st.session_state.chat_history):
-            with st.chat_message("user"):
-                st.write(query)
-            with st.chat_message("assistant"):
-                st.write(response)
-
+        st.header("💬 Chat Interface")
+        
+        # Chat history
+        chat_container = st.container()
+        with chat_container:
+            for i, (user_msg, ai_msg, sources) in enumerate(st.session_state.chat_history):
+                with st.chat_message("user"):
+                    st.write(user_msg)
+                
+                with st.chat_message("assistant"):
+                    st.write(ai_msg)
+                    
+                    if sources:
+                        with st.expander("📖 Sources"):
+                            for j, (chunk, score, metadata) in enumerate(sources):
+                                st.write(f"**Source {j+1}** (Score: {score:.3f}) - {metadata['filename']}")
+                                st.write(chunk[:200] + "..." if len(chunk) > 200 else chunk)
+                                st.divider()
+        
         # Chat input
-        query = st.chat_input("Ask a question about your document...")
-
-        if query:
-            # Add user message to chat history immediately
-            with st.chat_message("user"):
-                st.write(query)
-
-            # Generate response
-            with st.chat_message("assistant"):
-                with st.spinner("Analyzing document and generating response..."):
-                    try:
-                        # Update chatbot's vector store and chunks
-                        st.session_state.chatbot.vector_store = st.session_state.vector_store
-                        st.session_state.chatbot.document_chunks = st.session_state.document_chunks
-
-                        # Search for relevant chunks
-                        relevant_chunks = st.session_state.chatbot.search_similar_chunks(query, k=3)
-                        
-                        if not relevant_chunks:
-                            response = "I couldn't find relevant information in the document to answer your question."
-                        else:
-                            # Generate response
-                            response = st.session_state.chatbot.generate_response(query, relevant_chunks)
-
-                        st.write(response)
-
-                        # Add to chat history
-                        st.session_state.chat_history.append((query, response))
-                        
-                    except Exception as e:
-                        error_response = f"Sorry, I encountered an error: {str(e)}"
-                        st.error(error_response)
-                        st.session_state.chat_history.append((query, error_response))
-
-            st.rerun()
+        if query := st.chat_input("Ask a question about your documents..."):
+            if not st.session_state.rag_agent.documents:
+                st.error("Please upload and process PDF documents first!")
+            else:
+                with st.chat_message("user"):
+                    st.write(query)
+                
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        response, sources = st.session_state.rag_agent.chat(query)
+                    
+                    st.write(response)
+                    
+                    if sources:
+                        with st.expander("📖 Sources"):
+                            for j, (chunk, score, metadata) in enumerate(sources):
+                                st.write(f"**Source {j+1}** (Score: {score:.3f}) - {metadata['filename']}")
+                                st.write(chunk[:200] + "..." if len(chunk) > 200 else chunk)
+                                st.divider()
+                
+                # Add to chat history
+                st.session_state.chat_history.append((query, response, sources))
     
     with col2:
-        if st.session_state.document_chunks:
-            st.subheader("📊 Document Stats")
-            st.metric("Total Chunks", len(st.session_state.document_chunks))
+        st.header("⚙️ Settings")
+        
+        # Model info
+        with st.expander("🔧 Model Information"):
+            st.write("**LLM Model:** meta-llama/Llama-3.2-3B-Instruct")
+            st.write("**Embedding Model:** all-MiniLM-L6-v2")
+            st.write("**Vector Database:** FAISS")
+            st.write("**Similarity:** Cosine Similarity")
+        
+        # Clear chat history
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.chat_history = []
+            st.rerun()
+        
+        # Statistics
+        if st.session_state.rag_agent.documents:
+            st.subheader("📊 Statistics")
+            total_chunks = sum(doc['chunk_count'] for doc in st.session_state.rag_agent.documents)
+            st.metric("Total Documents", len(st.session_state.rag_agent.documents))
+            st.metric("Total Chunks", total_chunks)
             st.metric("Chat Messages", len(st.session_state.chat_history))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except ImportError as e:
-        st.error(f"""
-        Missing required package: {e}
-
-        Please install the required packages:
-        ```bash
-        pip install streamlit PyPDF2 faiss-cpu sentence-transformers transformers torch numpy
-        ```
-        """)
-    except Exception as e:
-        st.error(f"Application error: {str(e)}")
-        st.stop()
+    st.markdown("""
+    ### 🚀 Setup Instructions
+    
+    Make sure to install the required packages:
+    ```bash
+    pip install streamlit torch transformers sentence-transformers faiss-cpu PyPDF2 numpy
+    ```
+    
+    For GPU support, install `faiss-gpu` instead of `faiss-cpu`.
+    
+    You may need to login to HuggingFace Hub:
+    ```bash
+    huggingface-cli login
+    ```
+    
+    Run the app with:
+    ```bash
+    streamlit run app.py
+    ```
+    """)
+    
+    main()
