@@ -169,7 +169,7 @@ Context:
             outputs = self.llm_model.generate(
                 **inputs,
                 max_new_tokens=512,
-                temperature=0.7,
+                temperature=0.3,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id
