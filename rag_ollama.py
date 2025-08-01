@@ -11,6 +11,10 @@ import pickle
 from typing import List, Dict, Tuple
 import tempfile
 from datetime import datetime
+from huggingface_hub import login
+
+hf_token = os.getenv('HF_TOKEN')
+login(token = hf_token)
 
 class EnhancedRAGAgent:
     def __init__(self, 
