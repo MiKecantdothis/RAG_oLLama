@@ -18,8 +18,8 @@ login(token = hf_token)
 
 class EnhancedRAGAgent:
     def __init__(self, 
-                 llm_model: str = "meta-llama/Llama-3.2-3B-Instruct",
-                 embedding_model: str = "all-MiniLM-L6-v2"):
+                 llm_model="meta-llama/Llama-3.2-3B-Instruct",
+                 embedding_model= "all-MiniLM-L6-v2"):
         """
         Initialize the enhanced RAG agent with sentence transformers and FAISS.
         
