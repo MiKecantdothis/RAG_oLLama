@@ -189,8 +189,8 @@ Context:
 
 
 def main():
-    st.set_page_config(page_title="RAG Agent with Llama 3.2", page_icon="🤖", layout="wide")
-    st.title("🤖 RAG Agent with Llama 3.2")
+    st.set_page_config(page_title="RAG Agent with Tiny Llama", page_icon="🐒", layout="wide")
+    st.title("🐒 RAG Agent with Tiny Llama")
     st.markdown("Upload PDF documents and chat with them using advanced AI!")
 
     if 'rag_agent' not in st.session_state:
