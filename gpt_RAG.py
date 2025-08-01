@@ -14,7 +14,7 @@ login(token = hf_token)
 
 class EnhancedRAGAgent:
     def __init__(self, 
-                 llm_model="meta-llama/Llama-3.2-3B-Instruct",
+                 llm_model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                  embedding_model="all-MiniLM-L6-v2"):
         self.embedding_model_name = embedding_model
         self.llm_model_name = llm_model
