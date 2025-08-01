@@ -443,25 +443,4 @@ def main():
 
 
 if __name__ == "__main__":
-    st.markdown("""
-    ### 🚀 Setup Instructions
-    
-    Make sure to install the required packages:
-    ```bash
-    pip install streamlit torch transformers sentence-transformers faiss-cpu PyPDF2 numpy
-    ```
-    
-    For GPU support, install `faiss-gpu` instead of `faiss-cpu`.
-    
-    You may need to login to HuggingFace Hub:
-    ```bash
-    huggingface-cli login
-    ```
-    
-    Run the app with:
-    ```bash
-    streamlit run app.py
-    ```
-    """)
-    
     main()
